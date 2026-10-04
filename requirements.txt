@@ -1,0 +1,7 @@
+Flask
+requests
+psutil
+mysql-connector-python
+pandas
+streamlit
+scikit-learn
