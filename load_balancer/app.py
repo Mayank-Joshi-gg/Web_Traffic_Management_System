@@ -15,7 +15,6 @@ SERVERS = [
 
 round_robin_index = 0
 
-
 def get_active_requests(server):
     try:
         response = requests.get(server["url"] + "/status", timeout=1)
@@ -23,15 +22,12 @@ def get_active_requests(server):
     except:
         return 999
 
-
 def choose_round_robin():
     global round_robin_index
 
     server = SERVERS[round_robin_index]
     round_robin_index = (round_robin_index + 1) % len(SERVERS)
-
     return server
-
 
 def choose_resource_aware():
     best_server = None
@@ -42,7 +38,7 @@ def choose_resource_aware():
     for server in SERVERS:
         active = get_active_requests(server)
 
-        # Simple score for this academic prototype.
+        # Simple score
         score = (
             resources["cpu"] * 0.4
             + resources["memory"] * 0.3
@@ -63,7 +59,6 @@ def choose_resource_aware():
             )
         except Exception as error:
             print("Database resource log skipped:", error)
-
     return best_server
 
 
