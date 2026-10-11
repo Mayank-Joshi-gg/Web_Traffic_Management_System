@@ -1,7 +1,7 @@
 from flask import Flask, jsonify, request
 import requests
 import time
-
+from concurrent.futures import ThreadPoolExecutor
 from monitoring.resource_monitor import get_resources
 from database.database import log_traffic, log_resources
 
@@ -15,6 +15,7 @@ SERVERS = [
 
 round_robin_index = 0
 
+
 def get_active_requests(server):
     try:
         response = requests.get(server["url"] + "/status", timeout=1)
@@ -22,44 +23,65 @@ def get_active_requests(server):
     except:
         return 999
 
+
 def choose_round_robin():
     global round_robin_index
 
     server = SERVERS[round_robin_index]
     round_robin_index = (round_robin_index + 1) % len(SERVERS)
+
     return server
 
-def choose_resource_aware():
-    best_server = None
-    best_score = float("inf")
 
-    resources = get_resources()
+def choose_resource_aware():
+    global round_robin_index
+
+    server_loads = []
 
     for server in SERVERS:
-        active = get_active_requests(server)
-
-        # Simple score
-        score = (
-            resources["cpu"] * 0.4
-            + resources["memory"] * 0.3
-            + active * 10 * 0.3
-        )
-
-        if score < best_score:
-            best_score = score
-            best_server = server
-
         try:
-            log_resources(
-                server["id"],
-                resources["cpu"],
-                resources["memory"],
-                resources["processes"],
-                active
+            response = requests.get(
+                server["url"] + "/status",
+                timeout=1
             )
-        except Exception as error:
-            print("Database resource log skipped:", error)
-    return best_server
+            response.raise_for_status()
+
+            active = response.json()["active_requests"]
+            server_loads.append((active, server))
+
+            print(f"Server {server['id']} | Active Requests: {active}")
+
+        except requests.RequestException:
+            print(f"Server {server['id']} is unavailable")
+
+    if not server_loads:
+        raise RuntimeError("No backend servers are available")
+
+    # Find the minimum observed load.
+    minimum_load = min(load for load, server in server_loads)
+
+    # Keep only servers having the minimum load.
+    best_servers = [
+        server for load, server in server_loads
+        if load == minimum_load
+    ]
+
+    # Rotate between tied servers.
+    selected = None
+
+    for offset in range(len(SERVERS)):
+        index = (round_robin_index + offset) % len(SERVERS)
+        candidate = SERVERS[index]
+
+        if any(s["id"] == candidate["id"] for s in best_servers):
+            selected = candidate
+            round_robin_index = (index + 1) % len(SERVERS)
+            break
+
+    print(f"Selected Server: {selected['id']}")
+    print("-" * 40)
+
+    return selected
 
 
 @app.route("/")
@@ -151,6 +173,43 @@ def test():
         "results": results
     })
 
+@app.route("/concurrent-test")
+def concurrent_test():
+    count = int(request.args.get("count", 20))
+    method = request.args.get("method", "resource")
 
+    def send_request(i):
+        start = time.time()
+
+        if method == "round_robin":
+            server = choose_round_robin()
+        else:
+            server = choose_resource_aware()
+
+        try:
+            response = requests.get(server["url"], timeout=3)
+            response.raise_for_status()
+
+            return {
+                "request": i + 1,
+                "server": server["id"],
+                "response_time": round(time.time() - start, 4)
+            }
+
+        except requests.RequestException:
+            return {
+                "request": i + 1,
+                "server": server["id"],
+                "error": "Server unavailable"
+            }
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        results = list(executor.map(send_request, range(count)))
+
+    return jsonify({
+        "routing_method": method,
+        "total_requests": count,
+        "results": results
+    })
 if __name__ == "__main__":
     app.run(port=5000, debug=False)
