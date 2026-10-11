@@ -11,7 +11,6 @@ SERVER_ID = PORT - 5000
 active_requests = 0
 lock = threading.Lock()
 
-
 @app.route("/")
 def home():
     global active_requests
@@ -21,7 +20,7 @@ def home():
 
     start = time.time()
 
-    # Small delay to make response-time comparison visible.
+    # A small delay to show response-time comparison .
     time.sleep(0.05)
 
     response = {
