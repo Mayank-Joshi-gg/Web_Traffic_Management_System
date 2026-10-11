@@ -8,14 +8,12 @@ servers = [
 ]
 
 processes = []
-
 try:
 
     for server in servers:
         process = subprocess.Popen(
             [sys.executable, server]
         )
-
         processes.append(process)
 
     print("All servers are running.")
