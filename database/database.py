@@ -1,10 +1,8 @@
 import mysql.connector
 from database.db_config import DB_CONFIG
 
-
 def get_connection():
     return mysql.connector.connect(**DB_CONFIG)
-
 
 def log_traffic(server_id, response_time, routing_method):
     connection = get_connection()
@@ -22,7 +20,6 @@ def log_traffic(server_id, response_time, routing_method):
     cursor.close()
     connection.close()
 
-
 def log_resources(server_id, cpu, memory, processes, active_requests):
     connection = get_connection()
     cursor = connection.cursor()
@@ -33,7 +30,7 @@ def log_resources(server_id, cpu, memory, processes, active_requests):
          active_processes, active_requests)
         VALUES (%s, %s, %s, %s, %s)
     '''
-
+    
     cursor.execute(
         query,
         (server_id, cpu, memory, processes, active_requests)
