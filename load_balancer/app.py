@@ -1,12 +1,15 @@
 from flask import Flask, jsonify, request
 import requests
 import time
-from concurrent.futures import ThreadPoolExecutor
-from monitoring.resource_monitor import get_resources
-from database.database import log_traffic, log_resources
+import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from prediction.traffic_prediction import predict_traffic
+from database.database import log_traffic
 
 app = Flask(__name__)
 
+# Backend server configuration.
 SERVERS = [
     {"id": 1, "url": "http://127.0.0.1:5001"},
     {"id": 2, "url": "http://127.0.0.1:5002"},
@@ -14,158 +17,320 @@ SERVERS = [
 ]
 
 round_robin_index = 0
+routing_lock = threading.Lock()
 
 
-def get_active_requests(server):
-    try:
-        response = requests.get(server["url"] + "/status", timeout=1)
-        return response.json()["active_requests"]
-    except:
-        return 999
-
+# --------------------------------------------------
+# ROUND ROBIN LOAD BALANCING
+# --------------------------------------------------
 
 def choose_round_robin():
+    """Choose servers in circular order."""
     global round_robin_index
 
-    server = SERVERS[round_robin_index]
-    round_robin_index = (round_robin_index + 1) % len(SERVERS)
+    with routing_lock:
+        server = SERVERS[round_robin_index % len(SERVERS)]
+        round_robin_index = (
+            round_robin_index + 1
+        ) % len(SERVERS)
 
     return server
 
 
+# --------------------------------------------------
+# RESOURCE-AWARE LOAD BALANCING
+# --------------------------------------------------
+
+def calculate_load_score(cpu, memory, active_requests):
+    """
+    Calculate a server load score.
+
+    CPU weight: 50%
+    Memory weight: 30%
+    Active-request weight: 20%
+
+    Lower score means lower estimated load.
+    """
+
+    # Normalize active requests to a scale from 0 to 100.
+    active_score = min(
+        active_requests / 10.0,
+        1.0
+    ) * 100
+
+    score = (
+        0.5 * cpu
+        + 0.3 * memory
+        + 0.2 * active_score
+    )
+
+    return round(score, 2)
+
+
 def choose_resource_aware():
-    global round_robin_index
+    """
+    Select the available server with the lowest
+    combined CPU, memory, and active-request score.
+    """
 
-    server_loads = []
+    server_statuses = []
 
+    # Collect resource information from each server.
     for server in SERVERS:
         try:
             response = requests.get(
                 server["url"] + "/status",
-                timeout=1
+                timeout=2
             )
+
             response.raise_for_status()
+            data = response.json()
 
-            active = response.json()["active_requests"]
-            server_loads.append((active, server))
+            if data.get("status") != "UP":
+                continue
 
-            print(f"Server {server['id']} | Active Requests: {active}")
+            cpu = float(data["cpu_usage"])
+            memory = float(data["memory_usage"])
+            active = int(data["active_requests"])
 
-        except requests.RequestException:
-            print(f"Server {server['id']} is unavailable")
+            # Reject invalid measurements.
+            if not (0 <= cpu <= 100):
+                continue
 
-    if not server_loads:
-        raise RuntimeError("No backend servers are available")
+            if not (0 <= memory <= 100):
+                continue
 
-    # Find the minimum observed load.
-    minimum_load = min(load for load, server in server_loads)
+            if active < 0:
+                continue
 
-    # Keep only servers having the minimum load.
-    best_servers = [
-        server for load, server in server_loads
-        if load == minimum_load
+            score = calculate_load_score(
+                cpu,
+                memory,
+                active
+            )
+
+            server_statuses.append({
+                "server": server,
+                "cpu": cpu,
+                "memory": memory,
+                "active_requests": active,
+                "score": score
+            })
+
+        except (
+            requests.RequestException,
+            ValueError,
+            TypeError,
+            KeyError
+        ):
+            # Ignore unavailable servers or invalid responses.
+            continue
+
+    if not server_statuses:
+        raise RuntimeError(
+            "No backend servers are available"
+        )
+
+    # Select the server with the lowest score.
+    lowest_score = min(
+        item["score"] for item in server_statuses
+    )
+
+    tied_servers = [
+        item for item in server_statuses
+        if item["score"] == lowest_score
     ]
 
-    # Rotate between tied servers.
-    selected = None
+    # Rotate among servers with equal scores.
+    global round_robin_index
 
-    for offset in range(len(SERVERS)):
-        index = (round_robin_index + offset) % len(SERVERS)
-        candidate = SERVERS[index]
+    with routing_lock:
+        selected = tied_servers[
+            round_robin_index % len(tied_servers)
+        ]
 
-        if any(s["id"] == candidate["id"] for s in best_servers):
-            selected = candidate
-            round_robin_index = (index + 1) % len(SERVERS)
-            break
+        round_robin_index += 1
 
-    print(f"Selected Server: {selected['id']}")
-    print("-" * 40)
+    # Print metrics for evaluation and debugging.
+    print(
+        f"Selected Server {selected['server']['id']} | "
+        f"CPU: {selected['cpu']}% | "
+        f"Memory: {selected['memory']}% | "
+        f"Active Requests: {selected['active_requests']} | "
+        f"Score: {selected['score']}"
+    )
 
-    return selected
+    return selected["server"]
 
 
-@app.route("/")
+# --------------------------------------------------
+# ROUTING METHOD SELECTOR
+# --------------------------------------------------
+
+def choose_server(method):
+    """Select a server using the requested method."""
+
+    method = method.lower().strip()
+
+    if method == "round_robin":
+        return choose_round_robin()
+
+    if method == "resource_aware":
+        return choose_resource_aware()
+
+    raise ValueError(
+        "Invalid method. Use 'round_robin' or 'resource_aware'."
+    )
+
+
+# --------------------------------------------------
+# FORWARD REQUEST TO BACKEND
+# --------------------------------------------------
+
+def forward_request(server, routing_method="unknown"):
+    """Forward a normal request and save its traffic record."""
+
+    start_time = time.monotonic()
+
+    response = requests.get(
+        server["url"] + "/",
+        timeout=10
+    )
+
+    response.raise_for_status()
+
+    elapsed = time.monotonic() - start_time
+    data = response.json()
+
+    # Save every successfully completed normal request for prediction.
+    try:
+        log_traffic(
+            server["id"],
+            round(elapsed, 4),
+            routing_method
+        )
+    except Exception as error:
+        # A database logging failure should not make a healthy
+        # backend request fail. The error remains visible in terminal.
+        app.logger.exception("Traffic logging failed: %s", error)
+
+    return {
+        "server": server["id"],
+        "response_time": round(elapsed, 4),
+        "backend_response": data
+    }
+
+
+# --------------------------------------------------
+# LOAD BALANCER HOME
+# --------------------------------------------------
+
+@app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "project": "Resource-Aware Predictive Web Traffic Management System",
-        "message": "Load balancer is running"
+        "message": "Load balancer is running",
+        "project": (
+            "Resource-Aware Predictive Web Traffic "
+            "Management System"
+        ),
+        "available_methods": [
+            "round_robin",
+            "resource_aware"
+        ]
     })
 
 
-@app.route("/request")
-def handle_request():
-    method = request.args.get("method", "resource")
+# --------------------------------------------------
+# SINGLE REQUEST
+# --------------------------------------------------
 
-    if method == "round_robin":
-        server = choose_round_robin()
-    else:
-        server = choose_resource_aware()
-        method = "resource_aware"
-
-    start = time.time()
+@app.route("/request", methods=["GET"])
+def single_request():
+    method = request.args.get(
+        "method",
+        "resource_aware"
+    ).lower().strip()
 
     try:
-        response = requests.get(server["url"], timeout=3)
-        response_time = time.time() - start
+        server = choose_server(method)
+        result = forward_request(server, method)
 
-        try:
-            log_traffic(
-                server["id"],
-                response_time,
-                method
-            )
-        except Exception as error:
-            print("Database traffic log skipped:", error)
+        result["routing_method"] = method
 
-        data = response.json()
-        data["routing_method"] = method
-        data["load_balancer_response_time"] = round(response_time, 4)
+        return jsonify(result)
 
-        return jsonify(data)
-
-    except requests.RequestException as error:
+    except ValueError as error:
         return jsonify({
-            "error": "Selected server is unavailable",
+            "error": str(error)
+        }), 400
+
+    except (
+        requests.RequestException,
+        RuntimeError
+    ) as error:
+        return jsonify({
+            "error": "Could not process the request",
             "details": str(error)
         }), 503
 
 
-@app.route("/test")
-def test():
-    count = int(request.args.get("count", 10))
-    method = request.args.get("method", "resource")
+# --------------------------------------------------
+# SEQUENTIAL TEST
+# --------------------------------------------------
+
+@app.route("/test", methods=["GET"])
+def test_requests():
+    try:
+        count = int(request.args.get("count", 5))
+
+    except (ValueError, TypeError):
+        return jsonify({
+            "error": "count must be an integer"
+        }), 400
+
+    method = request.args.get(
+        "method",
+        "resource_aware"
+    ).lower().strip()
+
+    if not 1 <= count <= 100:
+        return jsonify({
+            "error": "count must be between 1 and 100"
+        }), 400
+
+    if method not in (
+        "round_robin",
+        "resource_aware"
+    ):
+        return jsonify({
+            "error": (
+                "method must be round_robin "
+                "or resource_aware"
+            )
+        }), 400
 
     results = []
 
-    for i in range(count):
-        start = time.time()
-
-        if method == "round_robin":
-            server = choose_round_robin()
-        else:
-            server = choose_resource_aware()
-
+    for request_number in range(1, count + 1):
         try:
-            response = requests.get(server["url"], timeout=3)
-            elapsed = time.time() - start
+            server = choose_server(method)
+            result = forward_request(server, method)
 
-            try:
-                log_traffic(server["id"], elapsed, method)
-            except Exception as error:
-                print("Database traffic log skipped:", error)
+            result["request"] = request_number
+            result["routing_method"] = method
 
-            results.append({
-                "request": i + 1,
-                "server": server["id"],
-                "response_time": round(elapsed, 4)
-            })
+            results.append(result)
 
-        except requests.RequestException:
-            results.append({
-                "request": i + 1,
-                "server": server["id"],
-                "error": "server unavailable"
-            })
+        except (
+            requests.RequestException,
+            RuntimeError
+        ) as error:
+            return jsonify({
+                "error": "A backend request failed",
+                "failed_request": request_number,
+                "details": str(error),
+                "results": results
+            }), 503
 
     return jsonify({
         "routing_method": method,
@@ -173,43 +338,218 @@ def test():
         "results": results
     })
 
-@app.route("/concurrent-test")
+
+# --------------------------------------------------
+# CONCURRENT TEST
+# --------------------------------------------------
+
+@app.route("/concurrent-test", methods=["GET"])
 def concurrent_test():
-    count = int(request.args.get("count", 20))
-    method = request.args.get("method", "resource")
+    try:
+        count = int(request.args.get("count", 10))
 
-    def send_request(i):
-        start = time.time()
+        method = request.args.get(
+            "method",
+            "resource_aware"
+        ).lower().strip()
 
-        if method == "round_robin":
+        if not 1 <= count <= 100:
+            return jsonify({
+                "error": "count must be between 1 and 100"
+            }), 400
+
+        if method not in (
+            "round_robin",
+            "resource_aware"
+        ):
+            return jsonify({
+                "error": "Invalid routing method"
+            }), 400
+
+        def run_one_request(number):
+            server = choose_server(method)
+            result = forward_request(server, method)
+
+            result["request"] = number
+            result["routing_method"] = method
+
+            return result
+
+        results = []
+
+        with ThreadPoolExecutor(
+            max_workers=min(count, 10)
+        ) as executor:
+
+            futures = {
+                executor.submit(
+                    run_one_request,
+                    number
+                ): number
+                for number in range(1, count + 1)
+            }
+
+            for future in as_completed(futures):
+                try:
+                    results.append(future.result())
+
+                except Exception as error:
+                    results.append({
+                        "request": futures[future],
+                        "error": str(error)
+                    })
+
+        results.sort(
+            key=lambda item: item["request"]
+        )
+
+        return jsonify({
+            "routing_method": method,
+            "total_requests": count,
+            "successful_requests": sum(
+                1 for item in results
+                if "error" not in item
+            ),
+            "results": results
+        })
+
+    except Exception as error:
+        app.logger.exception(
+            "Concurrent test failed"
+        )
+
+        return jsonify({
+            "error": "Concurrent test failed",
+            "details": str(error)
+        }), 500
+
+
+# --------------------------------------------------
+# TIME-QUANTUM DEMONSTRATION
+# --------------------------------------------------
+
+@app.route("/quantum-test", methods=["GET"])
+def quantum_test():
+    """Run a cooperative, application-level Round Robin simulation."""
+    try:
+        count = int(request.args.get("count", 3))
+        quantum = float(request.args.get("quantum", 2))
+
+        if not 1 <= count <= 20:
+            return jsonify({"error": "count must be between 1 and 20"}), 400
+        if not 0 < quantum <= 10:
+            return jsonify({
+                "error": "quantum must be greater than 0 and at most 10"
+            }), 400
+
+        # Each job represents a fixed amount of simulated work (seconds).
+        work_times = [5.0, 3.0, 7.0]
+        jobs = deque([
+            {
+                "job_id": job_number,
+                "remaining_work": work_times[(job_number - 1) % len(work_times)]
+            }
+            for job_number in range(1, count + 1)
+        ])
+
+        results = []
+        turn = 0
+        # Defensive limit: every turn must reduce remaining work.
+        max_turns = sum(
+            int((job["remaining_work"] + quantum - 1e-9) // quantum) + 1
+            for job in jobs
+        ) + count + 5
+
+        while jobs and turn < max_turns:
+            job = jobs.popleft()
+            turn += 1
             server = choose_round_robin()
-        else:
-            server = choose_resource_aware()
 
-        try:
-            response = requests.get(server["url"], timeout=3)
+            response = requests.post(
+                server["url"] + "/process-chunk",
+                json={
+                    "job_id": job["job_id"],
+                    "quantum": quantum,
+                    "remaining_work": job["remaining_work"]
+                },
+                timeout=quantum + 10
+            )
             response.raise_for_status()
+            data = response.json()
 
-            return {
-                "request": i + 1,
-                "server": server["id"],
-                "response_time": round(time.time() - start, 4)
+            # Validate backend response before updating the ready queue.
+            required = {
+                "server_id", "execution_time", "remaining_work", "completed"
             }
+            missing = required.difference(data)
+            if missing:
+                raise ValueError(
+                    "Backend /process-chunk response is missing: "
+                    + ", ".join(sorted(missing))
+                )
 
-        except requests.RequestException:
-            return {
-                "request": i + 1,
-                "server": server["id"],
-                "error": "Server unavailable"
-            }
+            remaining = float(data["remaining_work"])
+            if remaining < 0:
+                raise ValueError("Backend returned negative remaining_work")
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        results = list(executor.map(send_request, range(count)))
+            job["remaining_work"] = remaining
+            results.append({
+                "turn": turn,
+                "job_id": job["job_id"],
+                "server": data["server_id"],
+                "execution_time": round(float(data["execution_time"]), 4),
+                "remaining_work": round(remaining, 4),
+                "completed": bool(data["completed"])
+            })
 
-    return jsonify({
-        "routing_method": method,
-        "total_requests": count,
-        "results": results
-    })
+            if not bool(data["completed"]):
+                # The unfinished job goes to the end of the ready queue.
+                jobs.append(job)
+
+        if jobs:
+            return jsonify({
+                "error": "Maximum scheduling turns exceeded",
+                "details": "A job did not finish; check /process-chunk implementation.",
+                "results": results
+            }), 500
+
+        return jsonify({
+            "algorithm": "Time-Quantum Round Robin Demonstration",
+            "time_quantum": quantum,
+            "total_jobs": count,
+            "total_turns": turn,
+            "results": results
+        })
+
+    except (ValueError, TypeError) as error:
+        return jsonify({"error": "Invalid quantum test input", "details": str(error)}), 400
+    except Exception as error:
+        app.logger.exception("Quantum test failed")
+        return jsonify({
+            "error": "Quantum test failed",
+            "details": str(error)
+        }), 500
+
+
+@app.route("/prediction", methods=["GET"])
+def traffic_prediction_api():
+    try:
+        result = predict_traffic()
+        return result, 200
+
+    except Exception as error:
+        return {
+            "status": "error",
+            "message": "Unable to generate traffic prediction.",
+            "details": str(error)
+        }, 500
+# --------------------------------------------------
+# START LOAD BALANCER
+# --------------------------------------------------
+
 if __name__ == "__main__":
-    app.run(port=5000, debug=False)
+    app.run(
+        host="127.0.0.1",
+        port=5000,
+        threaded=True
+    )
