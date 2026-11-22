@@ -25,8 +25,7 @@ CREATE TABLE IF NOT EXISTS traffic_logs (
     response_time FLOAT,
     routing_method VARCHAR(30),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (server_id) REFERENCES servers(server_id)
-);
+    FOREIGN KEY (server_id) REFERENCES servers(server_id));
 
 INSERT IGNORE INTO servers (server_id, server_name, port, status)
 VALUES
